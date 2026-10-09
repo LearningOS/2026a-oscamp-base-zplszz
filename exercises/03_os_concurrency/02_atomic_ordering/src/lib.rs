@@ -34,27 +34,22 @@ impl FlagChannel {
 
     /// Producer: store data first, then set ready flag.
     ///
-    /// TODO: Choose correct Ordering
-    /// - What Ordering should be used for writing data?
-    /// - What Ordering should be used for writing ready? (ensuring data writes are visible to consumer)
+    /// Use for one producer/consumer exchange; reset only after both are done.
     pub fn produce(&self, value: u32) {
-        // TODO: Store data (choose appropriate Ordering)
-        // TODO: Set ready = true (choose appropriate Ordering so data writes complete before this)
-        todo!()
+        self.data.store(value, Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
     }
 
     /// Consumer: spin-wait for ready flag, then read data.
     ///
-    /// TODO: Choose correct Ordering
-    /// - What Ordering should be used for reading ready? (ensuring it sees data writes from produce)
-    /// - What Ordering should be used for reading data?
     pub fn consume(&self) -> u32 {
-        // TODO: Spin-wait for ready to become true (choose appropriate Ordering)
-        // TODO: Read data (choose appropriate Ordering)
-        todo!()
+        while !self.ready.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        self.data.load(Ordering::Relaxed)
     }
 
-    /// Reset channel state
+    /// Reset channel state after the producer and consumer have finished.
     pub fn reset(&self) {
         self.ready.store(false, Ordering::Relaxed);
         self.data.store(0, Ordering::Relaxed);
@@ -64,6 +59,7 @@ impl FlagChannel {
 /// A simple once-initializer using SeqCst.
 /// Guarantees `init` is executed only once, and all threads see the initialized value.
 pub struct OnceCell {
+    initializing: AtomicBool,
     initialized: AtomicBool,
     value: AtomicU32,
 }
@@ -71,6 +67,7 @@ pub struct OnceCell {
 impl OnceCell {
     pub const fn new() -> Self {
         Self {
+            initializing: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
             value: AtomicU32::new(0),
         }
@@ -81,15 +78,39 @@ impl OnceCell {
     ///
     /// Hint: use `compare_exchange` to ensure only one thread succeeds.
     pub fn init(&self, val: u32) -> bool {
-        // TODO: Use compare_exchange to ensure initialization only once
-        // Store value on success
-        todo!()
+        if self
+            .initializing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        self.value.store(val, Ordering::SeqCst);
+        // Claiming initialization and publishing completion are separate steps:
+        // readers must never see Some(0) while the winner is still writing.
+        self.initialized.store(true, Ordering::SeqCst);
+        true
     }
 
     /// Get value. Returns Some if initialized, otherwise None.
     pub fn get(&self) -> Option<u32> {
-        // TODO: Check initialized flag, then read value
-        todo!()
+        if self.initialized.load(Ordering::SeqCst) {
+            Some(self.value.load(Ordering::SeqCst))
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for FlagChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for OnceCell {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -98,6 +119,65 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn test_once_cell_does_not_publish_claimed_initialization() {
+        let cell = OnceCell::new();
+        // Simulate a winner paused after claiming initialization.
+        cell.initializing.store(true, Ordering::SeqCst);
+        assert_eq!(cell.get(), None);
+        assert!(!cell.init(99));
+        cell.value.store(42, Ordering::SeqCst);
+        cell.initialized.store(true, Ordering::SeqCst);
+        assert_eq!(cell.get(), Some(42));
+    }
+
+    #[test]
+    fn test_once_cell_value_visible_before_publication() {
+        for value in 1..=64 {
+            let cell = OnceCell::new();
+            let barrier = std::sync::Barrier::new(2);
+            thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    assert!(cell.init(value));
+                });
+                barrier.wait();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if let Some(actual) = cell.get() {
+                        assert_eq!(actual, value);
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "initialization timed out"
+                    );
+                    thread::yield_now();
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn test_once_cell_zero_is_valid() {
+        let cell = OnceCell::default();
+        assert!(cell.init(0));
+        assert_eq!(cell.get(), Some(0));
+        assert!(!cell.init(1));
+    }
+
+    #[test]
+    fn test_flag_channel_reset_and_reuse() {
+        let channel = FlagChannel::default();
+        channel.produce(42);
+        assert_eq!(channel.consume(), 42);
+        channel.reset();
+        thread::scope(|scope| {
+            scope.spawn(|| channel.produce(99));
+            assert_eq!(channel.consume(), 99);
+        });
+    }
 
     #[test]
     fn test_flag_channel() {

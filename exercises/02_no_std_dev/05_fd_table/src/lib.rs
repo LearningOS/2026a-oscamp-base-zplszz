@@ -38,7 +38,11 @@
 //! - fd number reuse strategy (find smallest free slot)
 //! - `Arc` reference counting and resource release
 
-use std::sync::Arc;
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
+
+use alloc::{sync::Arc, vec::Vec};
 
 /// File abstraction trait — all "files" in the kernel (regular files, pipes, sockets) implement this
 pub trait File: Send + Sync {
@@ -48,42 +52,42 @@ pub trait File: Send + Sync {
 
 /// File descriptor table
 pub struct FdTable {
-    // TODO: Design the internal structure
-    // Hint: use Vec<Option<Arc<dyn File>>>
-    //       the index is the fd number, None means the fd is closed or unallocated
+    files: Vec<Option<Arc<dyn File>>>,
 }
 
 impl FdTable {
     /// Create an empty fd table
     pub fn new() -> Self {
-        // TODO
-        todo!()
+        Self { files: Vec::new() }
     }
 
     /// Allocate a new fd, return the fd number.
     ///
     /// Prefers reusing the smallest closed fd number; if no free slot, appends to the end.
     pub fn alloc(&mut self, file: Arc<dyn File>) -> usize {
-        // TODO
-        todo!()
+        if let Some(fd) = self.files.iter().position(Option::is_none) {
+            self.files[fd] = Some(file);
+            fd
+        } else {
+            let fd = self.files.len();
+            self.files.push(Some(file));
+            fd
+        }
     }
 
     /// Get the file object for an fd. Returns None if the fd doesn't exist or is closed.
     pub fn get(&self, fd: usize) -> Option<Arc<dyn File>> {
-        // TODO
-        todo!()
+        self.files.get(fd).and_then(Option::as_ref).cloned()
     }
 
     /// Close an fd. Returns true on success, false if the fd doesn't exist or is already closed.
     pub fn close(&mut self, fd: usize) -> bool {
-        // TODO
-        todo!()
+        self.files.get_mut(fd).and_then(Option::take).is_some()
     }
 
     /// Return the number of currently allocated fds (excluding closed ones)
     pub fn count(&self) -> usize {
-        // TODO
-        todo!()
+        self.files.iter().filter(|file| file.is_some()).count()
     }
 }
 
@@ -124,6 +128,38 @@ mod tests {
             self.write_log.lock().unwrap().push(buf.to_vec());
             buf.len() as isize
         }
+    }
+
+    #[test]
+    fn test_reuse_smallest_of_multiple_holes() {
+        let mut table = FdTable::new();
+        for i in 0..4 {
+            table.alloc(MockFile::new(i));
+        }
+        assert!(table.close(2));
+        assert!(table.close(0));
+        assert_eq!(table.alloc(MockFile::new(9)), 0);
+        assert_eq!(table.alloc(MockFile::new(8)), 2);
+        assert_eq!(table.count(), 4);
+        assert!(!table.close(usize::MAX));
+        assert!(table.get(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn test_close_releases_table_reference_only() {
+        let mut table = FdTable::default();
+        let file = MockFile::new(7);
+        let weak = Arc::downgrade(&file);
+        let fd = table.alloc(file);
+        let handle = table.get(fd).unwrap();
+        assert!(table.close(fd));
+        assert!(!table.close(fd));
+        let mut buf = [0u8; 1];
+        assert_eq!(handle.read(&mut buf), 1);
+        assert_eq!(buf, [7]);
+        assert!(weak.upgrade().is_some());
+        drop(handle);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

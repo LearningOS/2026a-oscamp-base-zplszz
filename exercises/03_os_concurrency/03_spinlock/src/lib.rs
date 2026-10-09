@@ -31,32 +31,36 @@ impl<T> SpinLock<T> {
 
     /// Acquire lock, returning a mutable reference to inner data.
     ///
-    /// TODO: Use compare_exchange to spin until lock is acquired
-    /// 1. In a loop, try to change locked from false to true
-    /// 2. Success uses Acquire ordering, failure uses Relaxed
-    /// 3. On failure call `core::hint::spin_loop()` to hint CPU
-    /// 4. On success return `&mut *self.data.get()`
-    ///
-    /// # Safety
-    /// Caller must ensure `unlock` is called after using the data.
+    /// This manual-lock exercise requires the caller to stop using the returned
+    /// reference before calling `unlock`, and to unlock only a lock it holds.
+    /// Prefer the RAII guard in the next exercise for a safe public API.
+    #[allow(clippy::mut_from_ref)]
     pub fn lock(&self) -> &mut T {
-        // TODO
-        todo!()
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        unsafe { &mut *self.data.get() }
     }
 
     /// Release lock.
     ///
-    /// TODO: Set locked to false (using Release ordering)
     pub fn unlock(&self) {
-        // TODO
-        todo!()
+        self.locked.store(false, Ordering::Release);
     }
 
     /// Try to acquire lock without spinning.
     /// Returns Some(&mut T) on success, None if lock is busy.
+    /// The same manual-lock protocol as `lock` applies.
+    #[allow(clippy::mut_from_ref)]
     pub fn try_lock(&self) -> Option<&mut T> {
-        // TODO: Single compare_exchange attempt
-        todo!()
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| unsafe { &mut *self.data.get() })
     }
 }
 
@@ -65,6 +69,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn test_try_lock_busy_then_reacquire() {
+        let lock = SpinLock::new(0);
+        *lock.lock() = 42;
+        assert!(lock.try_lock().is_none());
+        lock.unlock();
+        assert_eq!(*lock.try_lock().unwrap(), 42);
+        lock.unlock();
+    }
 
     #[test]
     fn test_basic_lock_unlock() {

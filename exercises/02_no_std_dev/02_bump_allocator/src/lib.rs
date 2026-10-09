@@ -56,6 +56,9 @@ impl BumpAllocator {
     }
 
     /// Reset the allocator (free all allocated memory).
+    ///
+    /// Must not race with allocations, and all previous allocations must be
+    /// unused before resetting.
     pub fn reset(&self) {
         self.next.store(self.heap_start, Ordering::SeqCst);
     }
@@ -63,18 +66,26 @@ impl BumpAllocator {
 
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // TODO: Implement bump allocation
-        //
-        // Steps:
-        // 1. Load current next (use Ordering::SeqCst)
-        // 2. Align next up to layout.align()
-        //    Hint: align_up(addr, align) = (addr + align - 1) & !(align - 1)
-        // 3. Compute allocation end = aligned + layout.size()
-        // 4. If end > heap_end, return null_mut()
-        // 5. Atomically update next to end using compare_exchange
-        //    (if CAS fails, another thread raced — retry in a loop)
-        // 6. Return the aligned address as a pointer
-        todo!()
+        let mut next = self.next.load(Ordering::SeqCst);
+        loop {
+            let Some(aligned) = next.checked_add(layout.align() - 1) else {
+                return null_mut();
+            };
+            let aligned = aligned & !(layout.align() - 1);
+            let Some(end) = aligned.checked_add(layout.size()) else {
+                return null_mut();
+            };
+            if end > self.heap_end {
+                return null_mut();
+            }
+            match self
+                .next
+                .compare_exchange(next, end, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return aligned as *mut u8,
+                Err(actual) => next = actual,
+            }
+        }
     }
 
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
@@ -96,6 +107,50 @@ mod tests {
         let start = heap.as_mut_ptr() as usize;
         let alloc = unsafe { BumpAllocator::new(start, start + HEAP_SIZE) };
         (alloc, heap)
+    }
+
+    #[test]
+    fn test_concurrent_allocations_are_disjoint() {
+        let (alloc, _heap) = make_allocator();
+        let barrier = std::sync::Barrier::new(8);
+        let layout = Layout::from_size_align(16, 16).unwrap();
+        let mut addresses = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let alloc = &alloc;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (0..16)
+                            .map(|_| {
+                                let ptr = unsafe { alloc.alloc(layout) };
+                                assert!(!ptr.is_null());
+                                assert_eq!(ptr as usize % 16, 0);
+                                ptr as usize
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        addresses.sort_unstable();
+        assert!(addresses.windows(2).all(|pair| pair[0] + 16 <= pair[1]));
+    }
+
+    #[test]
+    fn test_failed_allocation_does_not_advance() {
+        let (alloc, heap) = make_allocator();
+        let huge_alignment = Layout::from_size_align(1, 1usize << (usize::BITS - 2)).unwrap();
+        assert!(unsafe { alloc.alloc(huge_alignment) }.is_null());
+        let layout = Layout::from_size_align(HEAP_SIZE, 1).unwrap();
+        assert_eq!(
+            unsafe { alloc.alloc(layout) } as usize,
+            heap.as_ptr() as usize
+        );
     }
 
     #[test]
